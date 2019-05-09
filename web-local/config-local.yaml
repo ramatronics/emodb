@@ -168,6 +168,9 @@ blobStore:
         media_global: {}
         media_global_mirror: {}
         blob_global: {}
+  s3:
+    buckets:
+    - name: local-emodb--media-global-ugc
 
   approvedContentTypes:
   - application/json

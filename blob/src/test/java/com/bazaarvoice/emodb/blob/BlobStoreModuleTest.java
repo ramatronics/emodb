@@ -24,6 +24,7 @@ import com.bazaarvoice.emodb.table.db.generic.CachingTableDAO;
 import com.bazaarvoice.emodb.table.db.generic.MutexTableDAO;
 import com.codahale.metrics.MetricRegistry;
 import com.google.common.cache.Cache;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.net.HostAndPort;
@@ -107,7 +108,10 @@ public class BlobStoreModuleTest {
                                 .setSeeds("127.0.0.1")
                                 .setPartitioner("bop")
                                 .setKeyspaces(ImmutableMap.of(
-                                        "media_global", new KeyspaceConfiguration())))));
+                                        "media_global", new KeyspaceConfiguration()))))
+                        .setS3Configuration(new S3Configuration()
+                            .setS3BucketConfigurations(ImmutableList.of(new S3BucketConfiguration("local-emodb--media-global-ugc", null, null))))
+                );
 
                 bind(String.class).annotatedWith(SystemTablePlacement.class).toInstance("ugc_global:sys");
 

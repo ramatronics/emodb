@@ -29,6 +29,11 @@ public class BlobStoreConfiguration {
     private Map<String, CassandraConfiguration> _cassandraClusters;
 
     @Valid
+    @NotNull
+    @JsonProperty("s3")
+    private S3Configuration _s3Configuration;
+
+    @Valid
     @Nullable
     @JsonProperty("placementsUnderMove")
     private Map<String, String> _placementsUnderMove;
@@ -49,6 +54,15 @@ public class BlobStoreConfiguration {
 
     public BlobStoreConfiguration setValidTablePlacements(Set<String> validTablePlacements) {
         _validTablePlacements = validTablePlacements;
+        return this;
+    }
+
+    public S3Configuration getS3Configuration() {
+        return _s3Configuration;
+    }
+
+    public BlobStoreConfiguration setS3Configuration(S3Configuration s3Configuration) {
+        _s3Configuration = s3Configuration;
         return this;
     }
 

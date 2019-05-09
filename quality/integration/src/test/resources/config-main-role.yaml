@@ -123,6 +123,9 @@ blobStore:
         name: blob-cassandra
       keyspaces:
         media_global: {}
+  s3:
+    buckets:
+      - name: local-emodb--media-global-ugc
 
 
 queueService:

@@ -1,13 +1,24 @@
 package com.bazaarvoice.emodb.blob;
 
+import com.amazonaws.auth.AWSCredentialsProvider;
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.auth.STSAssumeRoleSessionCredentialsProvider;
+import com.amazonaws.services.s3.AmazonS3;
+import com.amazonaws.services.s3.AmazonS3ClientBuilder;
 import com.bazaarvoice.emodb.blob.api.BlobStore;
 import com.bazaarvoice.emodb.blob.core.BlobStoreProviderProxy;
-import com.bazaarvoice.emodb.blob.core.DefaultBlobStore;
-import com.bazaarvoice.emodb.blob.core.LocalBlobStore;
+import com.bazaarvoice.emodb.blob.core.CassandraBlobStore;
+import com.bazaarvoice.emodb.blob.core.LocalCassandraBlobStore;
+import com.bazaarvoice.emodb.blob.core.LocalS3BlobStore;
+import com.bazaarvoice.emodb.blob.core.S3BlobStore;
 import com.bazaarvoice.emodb.blob.core.SystemBlobStore;
 import com.bazaarvoice.emodb.blob.db.StorageProvider;
 import com.bazaarvoice.emodb.blob.db.astyanax.AstyanaxStorageProvider;
 import com.bazaarvoice.emodb.blob.db.astyanax.BlobPlacementFactory;
+import com.bazaarvoice.emodb.blob.db.s3.BucketNamesToS3Clients;
+import com.bazaarvoice.emodb.blob.db.s3.PlacementsToBuckets;
+import com.bazaarvoice.emodb.blob.db.s3.S3PlacementFactory;
+import com.bazaarvoice.emodb.blob.db.s3.S3StorageProvider;
 import com.bazaarvoice.emodb.cachemgr.api.CacheRegistry;
 import com.bazaarvoice.emodb.common.cassandra.CassandraConfiguration;
 import com.bazaarvoice.emodb.common.cassandra.CassandraFactory;
@@ -99,6 +110,7 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
+import java.util.stream.Collectors;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
@@ -161,6 +173,7 @@ public class BlobStoreModule extends PrivateModule {
                 .toInstance(ImmutableMap.<String, Long>of());
 
         bind(StorageProvider.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
+        bind(S3StorageProvider.class).asEagerSingleton();
         bind(DataCopyDAO.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
         bind(DataPurgeDAO.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
 
@@ -197,8 +210,10 @@ public class BlobStoreModule extends PrivateModule {
         }
 
         // Bind the BlobStore instance that the rest of the application will consume
-        bind(DefaultBlobStore.class).asEagerSingleton();
-        bind(BlobStore.class).annotatedWith(LocalBlobStore.class).to(DefaultBlobStore.class);
+        bind(CassandraBlobStore.class).asEagerSingleton();
+        bind(BlobStore.class).annotatedWith(LocalCassandraBlobStore.class).to(CassandraBlobStore.class);
+        bind(S3PlacementFactory.class).asEagerSingleton();
+        bind(BlobStore.class).annotatedWith(LocalS3BlobStore.class).to(S3BlobStore.class);
         expose(BlobStore.class);
 
         // Bind any methods annotated with @ParameterizedTimed
@@ -206,16 +221,17 @@ public class BlobStoreModule extends PrivateModule {
     }
 
     @Provides @Singleton
-    BlobStore provideBlobStore(@LocalBlobStore Provider<BlobStore> localBlobStoreProvider,
+    BlobStore provideBlobStore(@LocalCassandraBlobStore Provider<BlobStore> localCassandraBlobStoreProvider,
+                               @LocalS3BlobStore Provider<BlobStore> localS3BlobStoreProvider,
                                @SystemBlobStore Provider<BlobStore> systemBlobStoreProvider,
                                DataCenterConfiguration dataCenterConfiguration) {
         // Provides the unannotated version of the BlobStore
         // If this is the system data center, return the local BlobStore implementation
         // Otherwise return a proxy that delegates to local or remote system BlobStores
         if (dataCenterConfiguration.isSystemDataCenter()) {
-            return localBlobStoreProvider.get();
+            return new BlobStoreProviderProxy(localCassandraBlobStoreProvider, localS3BlobStoreProvider, localCassandraBlobStoreProvider);
         } else {
-            return new BlobStoreProviderProxy(localBlobStoreProvider, systemBlobStoreProvider);
+            return new BlobStoreProviderProxy(localCassandraBlobStoreProvider, localS3BlobStoreProvider, systemBlobStoreProvider);
         }
     }
 
@@ -367,5 +383,59 @@ public class BlobStoreModule extends PrivateModule {
     ConsistencyLevel provideBlobReadConsistency(BlobStoreConfiguration configuration) {
         // By default use local quorum
         return Optional.fromNullable(configuration.getReadConsistency()).or(ConsistencyLevel.CL_LOCAL_QUORUM);
+    }
+
+    @Provides @Singleton @PlacementsToBuckets
+    Map<String, String> providePlacementsToBucketNames(BlobStoreConfiguration configuration, @ValidTablePlacements Set<String> validPlacements) {
+        Map<String, String> placementsToS3BucketNames = configuration.getS3Configuration().getS3BucketConfigurations().stream()
+                .collect(Collectors.toMap(
+                        s3BucketConfiguration -> bucketNameToPlacement(s3BucketConfiguration.getName()),
+                        s3BucketConfiguration -> s3BucketConfiguration.getName())
+                );
+        checkArgument(validPlacements.size() == placementsToS3BucketNames.size());
+        checkArgument(validPlacements.containsAll(placementsToS3BucketNames.keySet()));
+        return placementsToS3BucketNames;
+    }
+
+    @Provides @Singleton @BucketNamesToS3Clients
+    Map<String, AmazonS3> provideBucketsToS3BucketConfigurations(BlobStoreConfiguration configuration, @ValidTablePlacements Set<String> validPlacements) {
+        return configuration.getS3Configuration().getS3BucketConfigurations().stream()
+                .collect(Collectors.toMap(
+                        s3BucketConfiguration -> s3BucketConfiguration.getName(),
+                        s3BucketConfiguration -> {
+                            AmazonS3ClientBuilder amazonS3ClientBuilder = AmazonS3ClientBuilder.standard()
+                                    .withCredentials(getAwsCredentialsProvider(s3BucketConfiguration));
+                                    //                            .withMetricsCollector(new MetricCounterOutputStream())
+                            if (null != configuration.getS3Configuration().getS3ClientConfiguration()) {
+                                //TODO
+//                                    .withClientConfiguration(new ClientConfiguration()
+//                                        .withMaxConnections(100)
+//                                        .withAccelerateModeEnabled(true);
+
+//                                amazonS3ClientBuilder.withClientConfiguration()
+                            }
+                            return amazonS3ClientBuilder
+                                    .build();
+                        })
+                );
+    }
+
+    private static String bucketNameToPlacement(String bucketName) {
+        String placementString = bucketName.split("--")[1];
+        return placementString.replaceFirst("-", "_").replaceFirst("-", ":");
+    }
+
+    private static AWSCredentialsProvider getAwsCredentialsProvider(final S3BucketConfiguration s3BucketConfiguration) {
+        final AWSCredentialsProvider credentialsProvider;
+        if (null != s3BucketConfiguration.getRoleArn()) {
+            final STSAssumeRoleSessionCredentialsProvider.Builder credentialsProviderBuilder = new STSAssumeRoleSessionCredentialsProvider.Builder(s3BucketConfiguration.getRoleArn(), s3BucketConfiguration.getName() + "session");
+            if (null != s3BucketConfiguration.getRoleExternalId()) {
+                credentialsProviderBuilder.withExternalId(s3BucketConfiguration.getRoleExternalId());
+            }
+            credentialsProvider = credentialsProviderBuilder.build();
+        } else {
+            credentialsProvider = new DefaultAWSCredentialsProviderChain();
+        }
+        return credentialsProvider;
     }
 }

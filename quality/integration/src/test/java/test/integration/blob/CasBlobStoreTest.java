@@ -3,6 +3,8 @@ package test.integration.blob;
 import com.bazaarvoice.emodb.blob.BlobStoreConfiguration;
 import com.bazaarvoice.emodb.blob.BlobStoreModule;
 import com.bazaarvoice.emodb.blob.BlobStoreZooKeeper;
+import com.bazaarvoice.emodb.blob.S3BucketConfiguration;
+import com.bazaarvoice.emodb.blob.S3Configuration;
 import com.bazaarvoice.emodb.blob.api.Blob;
 import com.bazaarvoice.emodb.blob.api.BlobMetadata;
 import com.bazaarvoice.emodb.blob.api.BlobNotFoundException;
@@ -15,7 +17,6 @@ import com.bazaarvoice.emodb.cachemgr.CacheManagerModule;
 import com.bazaarvoice.emodb.cachemgr.invalidate.InvalidationService;
 import com.bazaarvoice.emodb.common.cassandra.CassandraConfiguration;
 import com.bazaarvoice.emodb.common.cassandra.CqlDriverConfiguration;
-import com.bazaarvoice.emodb.common.cassandra.health.CassandraHealthCheck;
 import com.bazaarvoice.emodb.common.cassandra.test.TestCassandraConfiguration;
 import com.bazaarvoice.emodb.common.dropwizard.guice.Global;
 import com.bazaarvoice.emodb.common.dropwizard.guice.SelfHostAndPortModule;
@@ -52,6 +53,7 @@ import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.health.HealthCheck;
 import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
+import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
@@ -141,7 +143,11 @@ public class CasBlobStoreTest {
                 bind(BlobStoreConfiguration.class).toInstance(new BlobStoreConfiguration()
                         .setValidTablePlacements(ImmutableSet.of(TABLE_PLACEMENT))
                         .setCassandraClusters(ImmutableMap.<String, CassandraConfiguration>of(
-                                "media_global", new TestCassandraConfiguration("media_global", "ugc_blob"))));
+                                "media_global", new TestCassandraConfiguration("media_global", "ugc_blob")))
+                        .setS3Configuration(new S3Configuration()
+                                .setS3BucketConfigurations(ImmutableList.of(new S3BucketConfiguration("local-emodb--media-global-ugc", null, null)))
+                        )
+                );
 
                 DataStoreConfiguration dataStoreConfiguration = new DataStoreConfiguration()
                         .setValidTablePlacements(ImmutableSet.of("app_global:sys", "ugc_global:ugc"))
@@ -206,6 +212,7 @@ public class CasBlobStoreTest {
 
         _lifeCycle.start();
         TableOptions options = new TableOptionsBuilder().setPlacement(TABLE_PLACEMENT).build();
+
         Audit audit = new AuditBuilder().setLocalHost().build();
         _store.createTable(TABLE, options, ImmutableMap.<String, String>of(), audit);
     }
@@ -218,23 +225,6 @@ public class CasBlobStoreTest {
     @AfterClass
     public void teardown() throws Exception {
         _lifeCycle.stop();
-    }
-
-    @Test
-    public void testHealthCheck() throws Exception {
-        ArgumentCaptor<HealthCheck> captor = ArgumentCaptor.forClass(HealthCheck.class);
-        verify(_healthChecks, atLeastOnce()).addHealthCheck(Matchers.anyString(), captor.capture());
-        List<HealthCheck> healthChecks = captor.getAllValues();
-
-        int numCassandraHealthChecks = 0;
-        for (HealthCheck healthCheck : healthChecks) {
-            if (healthCheck instanceof CassandraHealthCheck) {
-                HealthCheck.Result result = healthCheck.execute();
-                assertTrue(result.isHealthy(), result.getMessage());
-                numCassandraHealthChecks++;
-            }
-        }
-        assertEquals(numCassandraHealthChecks, 3);  // app, ugc, media
     }
 
     @Test
