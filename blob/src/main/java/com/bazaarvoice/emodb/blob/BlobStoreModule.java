@@ -5,6 +5,7 @@ import com.bazaarvoice.emodb.blob.core.BlobStoreProviderProxy;
 import com.bazaarvoice.emodb.blob.core.DefaultBlobStore;
 import com.bazaarvoice.emodb.blob.core.LocalBlobStore;
 import com.bazaarvoice.emodb.blob.core.SystemBlobStore;
+import com.bazaarvoice.emodb.blob.db.MetadataProvider;
 import com.bazaarvoice.emodb.blob.db.StorageProvider;
 import com.bazaarvoice.emodb.blob.db.astyanax.AstyanaxStorageProvider;
 import com.bazaarvoice.emodb.blob.db.astyanax.BlobPlacementFactory;
@@ -161,6 +162,7 @@ public class BlobStoreModule extends PrivateModule {
                 .toInstance(ImmutableMap.<String, Long>of());
 
         bind(StorageProvider.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
+        bind(MetadataProvider.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
         bind(DataCopyDAO.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
         bind(DataPurgeDAO.class).to(AstyanaxStorageProvider.class).asEagerSingleton();
 

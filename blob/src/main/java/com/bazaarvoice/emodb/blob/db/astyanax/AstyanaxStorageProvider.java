@@ -1,6 +1,7 @@
 package com.bazaarvoice.emodb.blob.db.astyanax;
 
 import com.bazaarvoice.emodb.blob.BlobReadConsistency;
+import com.bazaarvoice.emodb.blob.db.MetadataProvider;
 import com.bazaarvoice.emodb.blob.db.StorageProvider;
 import com.bazaarvoice.emodb.blob.db.StorageSummary;
 import com.bazaarvoice.emodb.common.api.impl.LimitCounter;
@@ -88,7 +89,7 @@ import static com.google.common.base.Preconditions.checkNotNull;
  * com.netflix.astyanax.recipes.storage.ObjectWriter are much more aggressive about retries and concurrency, so they
  * likely have better performance than this does.
  */
-public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, DataPurgeDAO {
+public class AstyanaxStorageProvider implements StorageProvider, MetadataProvider, DataCopyDAO, DataPurgeDAO {
 
     private enum ColumnGroup {
         A,  // Metadata encoded as JSON
@@ -152,7 +153,7 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         }
     }
 
-    @ParameterizedTimed(type="AstyanaxStorageProvider")
+    @ParameterizedTimed(type = "AstyanaxStorageProvider")
     @Override
     public ByteBuffer readChunk(Table tbl, String blobId, int chunkId, long timestamp) {
         AstyanaxTable table = (AstyanaxTable) checkNotNull(tbl, "table");
@@ -184,7 +185,7 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
 
     @ParameterizedTimed(type="AstyanaxStorageProvider")
     @Override
-    public void deleteObject(Table tbl, String blobId, Integer chunkCount) {
+    public void deleteObjectWithMetadata(Table tbl, String blobId, Integer chunkCount) {
         AstyanaxTable table = (AstyanaxTable) checkNotNull(tbl, "table");
         for (AstyanaxStorage storage : table.getWriteStorage()) {
             BlobPlacement placement = (BlobPlacement) storage.getPlacement();
@@ -197,6 +198,25 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
     }
 
     @ParameterizedTimed(type="AstyanaxStorageProvider")
+    @Override
+    public void deleteObject(Table tbl, String blobId) {
+        AstyanaxTable table = (AstyanaxTable) checkNotNull(tbl, "table");
+        for (AstyanaxStorage storage : table.getWriteStorage()) {
+            BlobPlacement placement = (BlobPlacement) storage.getPlacement();
+
+            // Do a column range query on all the B and Z columns.  Don't get the A columns with the metadata.
+            Composite start = getColumnPrefix(ColumnGroup.B, Composite.ComponentEquality.LESS_THAN_EQUAL);
+            Composite end = getColumnPrefix(ColumnGroup.Z, Composite.ComponentEquality.GREATER_THAN_EQUAL);
+            ColumnList<Composite> columns = execute(placement.getKeyspace()
+                    .prepareQuery(placement.getBlobColumnFamily(), _readConsistency)
+                    .getKey(storage.getRowKey(blobId))
+                    .withColumnRange(start, end, false, Integer.MAX_VALUE));
+
+            deleteColumns(table, blobId, columns, CONSISTENCY_STRONG, null);
+        }
+    }
+
+    @ParameterizedTimed(type = "AstyanaxStorageProvider")
     @Override
     public void writeMetadata(Table tbl, String blobId, StorageSummary summary) {
         AstyanaxTable table = (AstyanaxTable) checkNotNull(tbl, "table");
@@ -232,12 +252,30 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         }
 
         // Cleanup older versions of the blob, if any (unlikely).
-        deleteOldColumns(table, blobId, columns, summary.getTimestamp());
+        deleteColumns(table, blobId, columns, ConsistencyLevel.CL_ANY, summary.getTimestamp());
 
         return summary;
     }
 
-    private StorageSummary toStorageSummary(ColumnList<Composite> columns) {
+    @Override
+    public void deleteMetadata(Table tbl, String blobId) {
+        AstyanaxTable table = (AstyanaxTable) checkNotNull(tbl, "table");
+        for (AstyanaxStorage storage : table.getWriteStorage()) {
+            BlobPlacement placement = (BlobPlacement) storage.getPlacement();
+
+            MutationBatch mutation = placement.getKeyspace().prepareMutationBatch(CONSISTENCY_STRONG);
+            mutation.withRow(placement.getBlobColumnFamily(), storage.getRowKey(blobId))
+                    .deleteColumn(getColumn(ColumnGroup.A, 0));
+            execute(mutation);
+        }
+    }
+
+    @Override
+    public long countMetadata(Table tbl) {
+        return countRowsInColumn(tbl, ColumnGroup.A);
+    }
+
+    private static StorageSummary toStorageSummary(ColumnList<Composite> columns) {
         if (columns.size() == 0) {
             return null;
         }
@@ -297,7 +335,7 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         }));
     }
 
-    private Iterator<Map.Entry<String, StorageSummary>> decodeMetadataRows(
+    private static Iterator<Map.Entry<String, StorageSummary>> decodeMetadataRows(
             final Iterator<Row<ByteBuffer, Composite>> rowIter, final AstyanaxTable table) {
         return new AbstractIterator<Map.Entry<String, StorageSummary>>() {
             @Override
@@ -315,7 +353,7 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
                     }
 
                     // Cleanup older versions of the blob, if any (unlikely).
-                    deleteOldColumns(table, blobId, columns, summary.getTimestamp());
+                    deleteColumns(table, blobId, columns, ConsistencyLevel.CL_ANY, summary.getTimestamp());
 
                     return Maps.immutableEntry(blobId, summary);
                 }
@@ -326,7 +364,13 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
 
     @ParameterizedTimed(type="AstyanaxStorageProvider")
     @Override
-    public long count(Table tbl) {
+    public long countObjects(Table tbl) {
+        // Constrain the search to just small columns.
+        // Especially, exclude column group Z with all the bytes.
+        return countRowsInColumn(tbl, ColumnGroup.B);
+    }
+
+    private long countRowsInColumn(Table tbl, ColumnGroup column) {
         checkNotNull(tbl, "table");
 
         AstyanaxTable table = (AstyanaxTable) tbl;
@@ -334,11 +378,11 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         BlobPlacement placement = (BlobPlacement) storage.getPlacement();
 
         // Limit the # of columns to retrieve since we just want to count rows, but we need one column to ignore range
-        // ghosts.  Constrain the search to just small columns.  Especially, exclude column group Z with all the bytes.
+        // ghosts.
         CompositeSerializer colSerializer = CompositeSerializer.get();
         ByteBufferRange columnRange = new RangeBuilder()
-                .setStart(getColumnPrefix(ColumnGroup.B, Composite.ComponentEquality.LESS_THAN_EQUAL), colSerializer)
-                .setEnd(getColumnPrefix(ColumnGroup.B, Composite.ComponentEquality.GREATER_THAN_EQUAL), colSerializer)
+                .setStart(getColumnPrefix(column, Composite.ComponentEquality.LESS_THAN_EQUAL), colSerializer)
+                .setEnd(getColumnPrefix(column, Composite.ComponentEquality.GREATER_THAN_EQUAL), colSerializer)
                 .setLimit(1)
                 .build();
         LimitCounter unlimited = LimitCounter.max();
@@ -559,18 +603,18 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         return DEFAULT_CHUNK_SIZE;
     }
 
-    private void deleteOldColumns(AstyanaxTable table, String blobId, ColumnList<Composite> columns, long timestamp) {
+    private static void deleteColumns(AstyanaxTable table, String blobId, ColumnList<Composite> columns, ConsistencyLevel consistency, Long timestamp) {
         for (AstyanaxStorage storage : table.getWriteStorage()) {
             BlobPlacement placement = (BlobPlacement) storage.getPlacement();
 
             // Any columns with a timestamp older than the one we expect must be from an old version
             // of the blob.  This should be rare, but if it happens clean up and delete the old data.
-            MutationBatch mutation = placement.getKeyspace().prepareMutationBatch(ConsistencyLevel.CL_ANY);
+            MutationBatch mutation = placement.getKeyspace().prepareMutationBatch(consistency);
             ColumnListMutation<Composite> row = mutation.withRow(
                     placement.getBlobColumnFamily(), storage.getRowKey(blobId));
             boolean found = false;
             for (Column<Composite> column : columns) {
-                if (column.getTimestamp() < timestamp) {
+                if (null != timestamp && column.getTimestamp() < timestamp) {
                     if (ColumnGroup.B.name().equals(column.getName().get(0, AsciiSerializer.get()))) {
                         int chunkId = column.getName().get(1, IntegerSerializer.get());
                         row.deleteColumn(getColumn(ColumnGroup.B, chunkId))
@@ -585,14 +629,14 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         }
     }
 
-    private Composite getColumn(ColumnGroup group, int index) {
+    private static Composite getColumn(ColumnGroup group, int index) {
         Composite column = new Composite();
         column.addComponent(group.name(), AsciiSerializer.get());
         column.addComponent(index, IntegerSerializer.get());
         return column;
     }
 
-    private Composite getColumnPrefix(ColumnGroup group, Composite.ComponentEquality equality) {
+    private static Composite getColumnPrefix(ColumnGroup group, Composite.ComponentEquality equality) {
         Composite column = new Composite();
         column.addComponent(group.name(), AsciiSerializer.get(), equality);
         return column;
@@ -602,7 +646,7 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
      * The Astyanax Composite behavior is broken in that a deserialized Composite is not .equal() to a normally
      * created Composite because the serializers aren't used correctly.  This function works around the problem.
      */
-    private boolean matches(Composite column, ColumnGroup group, int index) {
+    private static boolean matches(Composite column, ColumnGroup group, int index) {
         return column.size() == 2 &&
                 column.get(0, AsciiSerializer.get()).equals(group.name()) &&
                 column.get(1, IntegerSerializer.get()).equals(index);
@@ -612,7 +656,7 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
         return _tokenFactory.toString(_tokenFactory.fromByteArray(bytes));
     }
 
-    private <R> R execute(Execution<R> execution) {
+    private static <R> R execute(Execution<R> execution) {
         OperationResult<R> operationResult;
         try {
             operationResult = execution.execute();
@@ -626,14 +670,14 @@ public class AstyanaxStorageProvider implements StorageProvider, DataCopyDAO, Da
      * Force computation of the first item in an iterator so metrics calculations for a method reflect the cost of
      * the first batch of results.
      */
-    private <T> Iterator<T> touch(Iterator<T> iter) {
+    private static <T> Iterator<T> touch(Iterator<T> iter) {
         // Could return a Guava PeekingIterator after "if (iter.hasNext()) iter.peek()", but simply calling hasNext()
         // is sufficient for the iterator implementations used by this DAO class...
         iter.hasNext();
         return iter;
     }
 
-    private Runnable noop() {
+    private static Runnable noop() {
         return new Runnable() {
             @Override
             public void run() {

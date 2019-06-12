@@ -11,6 +11,7 @@ import com.bazaarvoice.emodb.blob.api.Names;
 import com.bazaarvoice.emodb.blob.api.Range;
 import com.bazaarvoice.emodb.blob.api.RangeSpecification;
 import com.bazaarvoice.emodb.blob.api.StreamSupplier;
+import com.bazaarvoice.emodb.blob.db.MetadataProvider;
 import com.bazaarvoice.emodb.blob.db.StorageProvider;
 import com.bazaarvoice.emodb.blob.db.StorageSummary;
 import com.bazaarvoice.emodb.common.api.impl.LimitCounter;
@@ -54,11 +55,15 @@ import static java.lang.String.format;
 public class DefaultBlobStore implements BlobStore {
     private final TableDAO _tableDao;
     private final StorageProvider _storageProvider;
+    private final MetadataProvider _metadataProvider;
 
     @Inject
-    public DefaultBlobStore(TableDAO tableDao, StorageProvider storageProvider) {
+    public DefaultBlobStore(TableDAO tableDao,
+                            StorageProvider storageProvider,
+                            MetadataProvider metadataProvider) {
         _tableDao = checkNotNull(tableDao, "tableDao");
         _storageProvider = checkNotNull(storageProvider, "storageProvider");
+        _metadataProvider = checkNotNull(metadataProvider, "metadataProvider");
     }
 
     @Override
@@ -162,7 +167,7 @@ public class DefaultBlobStore implements BlobStore {
     public long getTableApproximateSize(String tableName) throws UnknownTableException {
         checkLegalTableName(tableName);
         Table table = _tableDao.get(tableName);
-        return _storageProvider.count(table);
+        return _storageProvider.countObjects(table);
     }
 
     @Override
@@ -172,7 +177,7 @@ public class DefaultBlobStore implements BlobStore {
 
         Table table = _tableDao.get(tableName);
 
-        return newMetadata(table, blobId, _storageProvider.readMetadata(table, blobId));
+        return newMetadata(table, blobId, _metadataProvider.readMetadata(table, blobId));
     }
 
     @Override
@@ -185,7 +190,7 @@ public class DefaultBlobStore implements BlobStore {
 
         // Stream back results.  Don't hold them all in memory at once.
         LimitCounter remaining = new LimitCounter(limit);
-        return remaining.limit(Iterators.transform(_storageProvider.scanMetadata(table, fromBlobIdExclusive, remaining),
+        return remaining.limit(Iterators.transform(_metadataProvider.scanMetadata(table, fromBlobIdExclusive, remaining),
                 new Function<Map.Entry<String, StorageSummary>, BlobMetadata>() {
                     @Override
                     public BlobMetadata apply(Map.Entry<String, StorageSummary> entry) {
@@ -219,7 +224,7 @@ public class DefaultBlobStore implements BlobStore {
         final Table table = _tableDao.get(tableName);
 
         // Read the metadata for the blob.  This should verify that all chunks are present and available for reading.
-        final StorageSummary summary = _storageProvider.readMetadata(table, blobId);
+        final StorageSummary summary = _metadataProvider.readMetadata(table, blobId);
         BlobMetadata metadata = newMetadata(table, blobId, summary);
 
         // Support returning a specific byte range within the blob.
@@ -339,7 +344,7 @@ public class DefaultBlobStore implements BlobStore {
         String sha1 = Hex.encodeHexString(sha1In.getMessageDigest().digest());
 
         StorageSummary summary = new StorageSummary(length, chunkCount, chunkSize, md5, sha1, attributes, timestamp);
-        _storageProvider.writeMetadata(table, blobId, summary);
+        _metadataProvider.writeMetadata(table, blobId, summary);
     }
 
     @Override
@@ -349,7 +354,10 @@ public class DefaultBlobStore implements BlobStore {
 
         Table table = _tableDao.get(tableName);
 
-        _storageProvider.deleteObject(table, blobId, null);
+        _storageProvider.deleteObjectWithMetadata(table, blobId, null);
+//        TODO change to
+//        _storageProvider.deleteObject(table, blobId);
+//        _metadataProvider.deleteMetadata(table, blobId);
     }
 
     @Override

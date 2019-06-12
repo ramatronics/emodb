@@ -55,6 +55,7 @@ import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterators;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.inject.AbstractModule;
@@ -70,7 +71,6 @@ import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.retry.BoundedExponentialBackoffRetry;
 import org.apache.curator.test.TestingServer;
-import org.fest.util.Lists;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Matchers;
 import org.testng.annotations.AfterClass;
@@ -264,7 +264,8 @@ public class CasBlobStoreTest {
         String blobId = UUID.randomUUID().toString();
 
         // get fails initially
-        verifyNotExists(blobId);
+        verifyBlobNotExists(blobId);
+        verifyMetadataNotExists(blobId);
 
         // put some data and verify it, roughly 8MB
         verifyPutAndGet(blobId, randomBytes(0x812345), ImmutableMap.of("encoding", "image/jpeg", "name", "mycat.jpg", "owner", "clover"));
@@ -276,7 +277,8 @@ public class CasBlobStoreTest {
         _store.delete(TABLE, blobId);
 
         // get should fail after the delete
-        verifyNotExists(blobId);
+        verifyBlobNotExists(blobId);
+        verifyMetadataNotExists(blobId);
     }
 
     @Test
@@ -284,7 +286,8 @@ public class CasBlobStoreTest {
         String blobId = UUID.randomUUID().toString();
 
         // get fails initially
-        verifyNotExists(blobId);
+        verifyBlobNotExists(blobId);
+        verifyMetadataNotExists(blobId);
 
         // putBlob some data and verify it, roughly 8MB
         byte[] blobData = randomBytes(0x812345);
@@ -301,9 +304,18 @@ public class CasBlobStoreTest {
         return buf;
     }
 
-    private void verifyNotExists(String blobId) {
+    private void verifyBlobNotExists(String blobId) {
         try {
             _store.get(TABLE, blobId);
+            fail();
+        } catch (BlobNotFoundException e) {
+            // expected
+        }
+    }
+
+    private void verifyMetadataNotExists(String blobId) {
+        try {
+            _store.getMetadata(TABLE, blobId);
             fail();
         } catch (BlobNotFoundException e) {
             // expected
@@ -422,8 +434,11 @@ public class CasBlobStoreTest {
 
         assertEquals(Iterators.size(_store.scanMetadata(TABLE, null, Long.MAX_VALUE)), 0);
 
-        verifyNotExists(blobId1);
-        verifyNotExists(blobId2);
+        verifyBlobNotExists(blobId1);
+        verifyMetadataNotExists(blobId1);
+
+        verifyBlobNotExists(blobId2);
+        verifyMetadataNotExists(blobId2);
         Date now = new Date();
 
         ImmutableMap<String, String> attributes1 = ImmutableMap.of("encoding", "image/jpeg", "name", "mycat.jpg", "owner", "clover");
@@ -453,7 +468,8 @@ public class CasBlobStoreTest {
     public void testScanMetadataFromBlobIdExclusive() throws Exception {
         String blobId = "1";
 
-        verifyNotExists(blobId);
+        verifyBlobNotExists(blobId);
+        verifyMetadataNotExists(blobId);
         Date now = new Date();
 
         ImmutableMap<String, String> attributes = ImmutableMap.of("encoding", "image/jpeg", "name", "mycat.jpg", "owner", "clover");
